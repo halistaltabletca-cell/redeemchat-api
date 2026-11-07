@@ -29,6 +29,11 @@ const GID_RE = /^[a-z0-9]{6,40}$/;
 let store = { users: {}, packs: {}, configs: {}, update: null };   // users: id->ts; packs/configs: метаданные; update: {url,ts}
 try { store = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch {}
 if (!store.users) store.users = {}; if (!store.packs) store.packs = {}; if (!store.configs) store.configs = {};
+if (!store.portal) store.portal = { pin: null, pcUrl: '', androidUrl: '', requests: {} };
+const ENV_PIN = process.env.ADMIN_PIN || '';
+function portalPinSet() { return !!(ENV_PIN || store.portal.pin); }
+function portalPin() { return ENV_PIN || store.portal.pin || ''; }
+function portalAdmin(body) { return str(body.id, 14).toUpperCase() === ADMIN_ID && portalPinSet() && str(body.pin, 40) === portalPin(); }
 let dirty = false;
 function markUser(id) { if (!store.users[id]) dirty = true; store.users[id] = Date.now(); }
 setInterval(() => { if (!dirty) return; dirty = false; try { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(store)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); } catch (e) { console.warn('save', e.message); } }, 10000);
@@ -75,6 +80,174 @@ function cfgFile(id) { return path.join(CONFIGS_DIR, id + '.json'); }
 function loadConfig(id) { try { return JSON.parse(fs.readFileSync(cfgFile(id), 'utf8')); } catch { return null; } }
 function saveConfig(id, obj) { try { fs.writeFileSync(cfgFile(id) + '.tmp', JSON.stringify(obj)); fs.renameSync(cfgFile(id) + '.tmp', cfgFile(id)); return true; } catch (e) { console.warn('cfg save', e.message); return false; } }
 const hex = v => /^#[0-9a-fA-F]{3,8}$/.test(String(v || '')) ? String(v) : '';
+
+const PORTAL_HTML = `<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RedeemChat</title>
+<style>
+ :root{--bg:#0a0d13;--card:#121823;--line:rgba(255,255,255,.1);--fg:#e9eef6;--muted:#9aa7bd;--accent:#22d3aa;--accent-ink:#042b23;--bad:#ff6b6b}
+ *{box-sizing:border-box}
+ body{margin:0;background:var(--bg);color:var(--fg);font-family:"Segoe UI",system-ui,Arial,sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:20px}
+ .wrap{width:100%;max-width:440px}
+ .brand{display:flex;align-items:center;gap:12px;justify-content:center;margin-bottom:22px}
+ .mark{width:46px;height:46px;border-radius:12px;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.5rem;color:var(--accent-ink);background:linear-gradient(145deg,var(--accent),#12b6d4)}
+ .brand b{font-size:1.5rem;letter-spacing:-.02em}
+ .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:26px}
+ h1{font-size:1.25rem;margin:0 0 6px;text-wrap:balance}
+ p.sub{color:var(--muted);margin:0 0 18px;font-size:.95rem}
+ label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:6px}
+ input{width:100%;padding:12px 14px;border-radius:11px;border:1px solid var(--line);background:#0e131c;color:var(--fg);font-size:1rem;font-family:inherit;letter-spacing:.04em}
+ input:focus{outline:none;border-color:var(--accent)}
+ .btn{display:block;width:100%;margin-top:14px;padding:13px;border:none;border-radius:11px;font-size:1rem;font-weight:700;cursor:pointer;font-family:inherit;background:linear-gradient(140deg,var(--accent),#14b7d2);color:var(--accent-ink)}
+ .btn.ghost{background:#0e131c;color:var(--fg);border:1px solid var(--line)}
+ .btn.dl{text-decoration:none;text-align:center}
+ .btn.dis{opacity:.45;pointer-events:none}
+ .msg{margin-top:12px;font-size:.9rem;min-height:18px}
+ .msg.bad{color:var(--bad)} .msg.ok{color:var(--accent)}
+ .spin{width:34px;height:34px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:10px auto}
+ @keyframes spin{to{transform:rotate(360deg)}}
+ .center{text-align:center}
+ .req{display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--line);border-radius:11px;margin-bottom:8px}
+ .req b{font-family:monospace;letter-spacing:.06em;font-size:.95rem}
+ .req .st{margin-left:auto;font-size:.78rem;color:var(--muted)}
+ .mini{padding:7px 11px;border-radius:9px;font-size:.82rem;font-weight:700;border:none;cursor:pointer;font-family:inherit}
+ .mini.ok{background:var(--accent);color:var(--accent-ink)} .mini.no{background:#0e131c;color:var(--fg);border:1px solid var(--line)}
+ .hint{color:var(--muted);font-size:.8rem;margin-top:10px}
+ .hidden{display:none}
+ .foot{text-align:center;color:var(--muted);font-size:.78rem;margin-top:18px}
+</style>
+</head>
+<body>
+<div class="wrap">
+ <div class="brand"><span class="mark">R</span><b>RedeemChat</b></div>
+ <div class="card">
+  <div id="login">
+   <h1>Вход по номеру аккаунта</h1>
+   <p class="sub">Введи свой ID из RedeemChat (вид XXXX-XXXX-XXXX). Заявка уйдёт администратору — дождись одобрения.</p>
+   <label>Номер аккаунта</label>
+   <input id="accId" maxlength="14" placeholder="XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
+   <button class="btn" id="loginBtn">Отправить заявку на вход</button>
+   <div class="msg" id="loginMsg"></div>
+  </div>
+  <div id="pending" class="hidden center">
+   <div class="spin"></div>
+   <h1>Заявка отправлена</h1>
+   <p class="sub">Ждём, пока администратор одобрит вход. Окно обновится само.</p>
+   <button class="btn ghost" id="pendBack">Назад</button>
+  </div>
+  <div id="approved" class="hidden center">
+   <h1>Добро пожаловать!</h1>
+   <p class="sub">Твой вход одобрен. Скачай RedeemChat:</p>
+   <a class="btn dl" id="dlPc" href="#" target="_blank" rel="noopener">Скачать для ПК</a>
+   <a class="btn dl" id="dlAndroid" href="#" target="_blank" rel="noopener" style="margin-top:10px">Скачать для Android</a>
+   <div class="hint" id="dlNote"></div>
+  </div>
+  <div id="adminPin" class="hidden">
+   <h1 id="pinTitle">Вход администратора</h1>
+   <p class="sub" id="pinSub">Введи PIN-код администратора.</p>
+   <label>PIN-код</label>
+   <input id="pinInput" type="password" maxlength="40" placeholder="PIN" autocomplete="off">
+   <button class="btn" id="pinBtn">Войти</button>
+   <button class="btn ghost" id="pinBack">Назад</button>
+   <div class="msg" id="pinMsg"></div>
+  </div>
+  <div id="admin" class="hidden">
+   <h1>Панель администратора</h1>
+   <p class="sub">Ссылки на кнопки скачивания и заявки на вход.</p>
+   <label>Ссылка «Скачать для ПК»</label>
+   <input id="pcUrl" placeholder="https://..." autocomplete="off" spellcheck="false">
+   <label style="margin-top:10px">Ссылка «Скачать для Android»</label>
+   <input id="androidUrl" placeholder="https://..." autocomplete="off" spellcheck="false">
+   <button class="btn" id="saveLinks">Сохранить ссылки</button>
+   <div class="msg" id="adminMsg"></div>
+   <h1 style="font-size:1rem;margin:20px 0 8px">Заявки на вход</h1>
+   <div id="reqList"></div>
+   <button class="btn ghost" id="adminRefresh" style="margin-top:4px">Обновить список</button>
+  </div>
+ </div>
+ <div class="foot">RedeemChat - P2P-мессенджер</div>
+</div>
+<script>
+(function(){
+ var pin='';
+ var ADMIN='EXWQ-34D7-VMGT';
+ function $(i){return document.getElementById(i)}
+ function show(id){['login','pending','approved','adminPin','admin'].forEach(function(s){$(s).classList.toggle('hidden', s!==id)})}
+ function api(path, body){
+  return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){return r.json().then(function(j){return {code:r.status,j:j}})}).catch(function(){return {code:0,j:{}}})
+ }
+ function norm(v){
+  var c=(v||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);
+  var out=c.slice(0,4); if(c.length>4)out+='-'+c.slice(4,8); if(c.length>8)out+='-'+c.slice(8,12); return out;
+ }
+ $('accId').addEventListener('input',function(){this.value=norm(this.value)});
+ var pollTimer=null;
+ function startPoll(id){ stopPoll(); pollTimer=setInterval(function(){ api('/portal/status',{id:id}).then(function(r){ if(r.j.status==='approved'){ stopPoll(); showApproved(r.j) } }) },4000) }
+ function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null} }
+ function showApproved(j){
+   var pc=$('dlPc'),an=$('dlAndroid');
+   if(j.pc){pc.href=j.pc;pc.classList.remove('dis')}else{pc.href='#';pc.classList.add('dis')}
+   if(j.android){an.href=j.android;an.classList.remove('dis')}else{an.href='#';an.classList.add('dis')}
+   $('dlNote').textContent=(!j.pc&&!j.android)?'Ссылки на файлы ещё не заданы администратором.':'';
+   show('approved')
+ }
+ $('loginBtn').onclick=function(){
+  var id=norm($('accId').value); var m=$('loginMsg'); m.className='msg';
+  if(!/^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(id)){m.className='msg bad';m.textContent='Введи номер вида XXXX-XXXX-XXXX';return}
+  m.textContent='Отправляем...';
+  api('/portal/login',{id:id}).then(function(r){
+   if(r.j.admin){ $('pinTitle').textContent=r.j.pinSet?'Вход администратора':'Создать PIN администратора'; $('pinSub').textContent=r.j.pinSet?'Введи PIN-код администратора.':'Задай PIN-код (минимум 4 символа). Запомни его - он защищает панель.'; $('pinBtn').textContent=r.j.pinSet?'Войти':'Создать PIN'; window._pinSet=r.j.pinSet; m.textContent=''; $('pinInput').value=''; show('adminPin'); return }
+   if(r.j.status==='approved'){ m.textContent=''; showApproved(r.j); return }
+   if(r.j.status==='pending'){ m.textContent=''; show('pending'); startPoll(id); return }
+   m.className='msg bad'; m.textContent='Не получилось. Попробуй ещё раз.';
+  })
+ };
+ $('pendBack').onclick=function(){stopPoll();show('login')};
+ $('pinBack').onclick=function(){show('login')};
+ $('pinBtn').onclick=function(){
+  var p=$('pinInput').value; var m=$('pinMsg'); m.className='msg';
+  if(p.length<4){m.className='msg bad';m.textContent='PIN слишком короткий';return}
+  if(!window._pinSet){ api('/portal/admin/setpin',{id:ADMIN,pin:p}).then(function(r){ if(r.j.ok){pin=p;loadAdmin(m)}else{m.className='msg bad';m.textContent='Не удалось задать PIN (возможно, уже задан).'} }) }
+  else { pin=p; loadAdmin(m) }
+ };
+ function loadAdmin(m){
+  api('/portal/admin/data',{id:ADMIN,pin:pin}).then(function(r){
+   if(!r.j.ok){ if(m){m.className='msg bad';m.textContent='Неверный PIN'} return }
+   $('pcUrl').value=r.j.pcUrl||''; $('androidUrl').value=r.j.androidUrl||'';
+   renderReqs(r.j.requests||[]); show('admin')
+  })
+ }
+ function renderReqs(list){
+  var box=$('reqList'); if(!list.length){box.innerHTML='<p class="sub">Заявок пока нет.</p>';return}
+  box.innerHTML='';
+  list.forEach(function(rq){
+   var d=document.createElement('div'); d.className='req';
+   var st=rq.status==='approved'?'одобрен':rq.status==='rejected'?'отклонён':'ожидает';
+   var b=document.createElement('b'); b.textContent=rq.id;
+   var sp=document.createElement('span'); sp.className='st'; sp.textContent=st;
+   d.appendChild(b); d.appendChild(sp);
+   var ok=document.createElement('button'); ok.className='mini ok'; ok.textContent=rq.status==='approved'?'OK':'Принять';
+   ok.onclick=function(){ api('/portal/admin/approve',{id:ADMIN,pin:pin,target:rq.id}).then(function(){loadAdmin()}) };
+   var no=document.createElement('button'); no.className='mini no'; no.textContent='X';
+   no.onclick=function(){ api('/portal/admin/approve',{id:ADMIN,pin:pin,target:rq.id,reject:true,remove:true}).then(function(){loadAdmin()}) };
+   d.appendChild(ok); d.appendChild(no); box.appendChild(d)
+  })
+ }
+ $('adminRefresh').onclick=function(){loadAdmin()};
+ $('saveLinks').onclick=function(){
+  var m=$('adminMsg'); m.className='msg'; m.textContent='Сохраняем...';
+  api('/portal/admin/links',{id:ADMIN,pin:pin,pcUrl:$('pcUrl').value.trim(),androidUrl:$('androidUrl').value.trim()}).then(function(r){
+   if(r.j.ok){m.className='msg ok';m.textContent='Сохранено';$('pcUrl').value=r.j.pcUrl||'';$('androidUrl').value=r.j.androidUrl||''}else{m.className='msg bad';m.textContent='Ошибка (проверь PIN)'}
+  })
+ };
+})();
+</script>
+</body>
+</html>`;
+function sendHtml(res, html) { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }); res.end(html); }
 
 const server = http.createServer(async (req, res) => {
   const u = new URL(req.url, 'http://x');
@@ -269,7 +442,58 @@ const server = http.createServer(async (req, res) => {
     return send(res, 200, { ok: true, url });
   }
 
-  if (p === '/' || p === '/health') return send(res, 200, { ok: true, service: 'redeemchat-api' });
+  // ----- Портал загрузки (вход по номеру аккаунта, одобрение админом) -----
+  if (p === '/portal/login' && req.method === 'POST') {
+    const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
+    const id = str(body.id, 14).toUpperCase();
+    if (!ID_RE.test(id)) return send(res, 400, { error: 'bad id' });
+    if (id === ADMIN_ID) return send(res, 200, { admin: true, pinSet: portalPinSet() });
+    let r = store.portal.requests[id];
+    if (!r) { r = store.portal.requests[id] = { id, status: 'pending', ts: Date.now() }; dirty = true; markUser(id); }
+    if (r.status === 'approved') return send(res, 200, { status: 'approved', pc: store.portal.pcUrl, android: store.portal.androidUrl });
+    return send(res, 200, { status: 'pending' });
+  }
+  if (p === '/portal/status' && req.method === 'POST') {
+    const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
+    const id = str(body.id, 14).toUpperCase();
+    const r = store.portal.requests[id];
+    if (r && r.status === 'approved') return send(res, 200, { status: 'approved', pc: store.portal.pcUrl, android: store.portal.androidUrl });
+    return send(res, 200, { status: r ? r.status : 'none' });
+  }
+  if (p === '/portal/admin/setpin' && req.method === 'POST') {
+    const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
+    if (str(body.id, 14).toUpperCase() !== ADMIN_ID) return send(res, 403, { error: 'not admin' });
+    if (ENV_PIN) return send(res, 400, { error: 'pin fixed' });
+    if (store.portal.pin) return send(res, 400, { error: 'pin exists' });
+    const pin = str(body.pin, 40);
+    if (pin.length < 4) return send(res, 400, { error: 'short' });
+    store.portal.pin = pin; dirty = true;
+    return send(res, 200, { ok: true });
+  }
+  if (p === '/portal/admin/data' && req.method === 'POST') {
+    const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
+    if (!portalAdmin(body)) return send(res, 403, { error: 'auth' });
+    const requests = Object.values(store.portal.requests).sort((a, b) => b.ts - a.ts);
+    return send(res, 200, { ok: true, requests, pcUrl: store.portal.pcUrl, androidUrl: store.portal.androidUrl });
+  }
+  if (p === '/portal/admin/approve' && req.method === 'POST') {
+    const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
+    if (!portalAdmin(body)) return send(res, 403, { error: 'auth' });
+    const t = str(body.target, 14).toUpperCase(); const r = store.portal.requests[t];
+    if (r) { if (body.remove) delete store.portal.requests[t]; else r.status = body.reject ? 'rejected' : 'approved'; dirty = true; }
+    return send(res, 200, { ok: true });
+  }
+  if (p === '/portal/admin/links' && req.method === 'POST') {
+    const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
+    if (!portalAdmin(body)) return send(res, 403, { error: 'auth' });
+    store.portal.pcUrl = /^https?:\/\//i.test(body.pcUrl || '') ? str(body.pcUrl, 500) : '';
+    store.portal.androidUrl = /^https?:\/\//i.test(body.androidUrl || '') ? str(body.androidUrl, 500) : '';
+    dirty = true;
+    return send(res, 200, { ok: true, pcUrl: store.portal.pcUrl, androidUrl: store.portal.androidUrl });
+  }
+  if (p === '/' && req.method === 'GET') return sendHtml(res, PORTAL_HTML);
+
+  if (p === '/health') return send(res, 200, { ok: true, service: 'redeemchat-api' });
   return send(res, 404, { error: 'not found' });
 });
 server.listen(PORT, () => console.log(`RedeemChat API на порту ${PORT} (данные: ${DATA_FILE})`));
