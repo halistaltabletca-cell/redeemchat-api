@@ -29,11 +29,22 @@ const GID_RE = /^[a-z0-9]{6,40}$/;
 let store = { users: {}, packs: {}, configs: {}, update: null };   // users: id->ts; packs/configs: метаданные; update: {url,ts}
 try { store = JSON.parse(fs.readFileSync(DATA_FILE, 'utf8')); } catch {}
 if (!store.users) store.users = {}; if (!store.packs) store.packs = {}; if (!store.configs) store.configs = {};
-if (!store.portal) store.portal = { pin: null, pcUrl: '', androidUrl: '', requests: {} };
+if (!store.portal) store.portal = { pin: null, pcUrl: '', androidUrl: '', pcFile: null, androidFile: null, requests: {} };
+if (!('pcFile' in store.portal)) store.portal.pcFile = null;
+if (!('androidFile' in store.portal)) store.portal.androidFile = null;
+const PORTAL_DIR = process.env.RC_PORTAL_DIR || path.join(path.dirname(DATA_FILE), 'rc-portal');
+try { fs.mkdirSync(PORTAL_DIR, { recursive: true }); } catch {}
+const MAX_UPLOAD = 220 * 1024 * 1024;
 const ENV_PIN = process.env.ADMIN_PIN || '';
 function portalPinSet() { return !!(ENV_PIN || store.portal.pin); }
 function portalPin() { return ENV_PIN || store.portal.pin || ''; }
 function portalAdmin(body) { return str(body.id, 14).toUpperCase() === ADMIN_ID && portalPinSet() && str(body.pin, 40) === portalPin(); }
+function portalAdminHdr(req) { return str(req.headers['x-admin-id'], 14).toUpperCase() === ADMIN_ID && portalPinSet() && str(req.headers['x-admin-pin'], 40) === portalPin(); }
+function effDl(target) {
+  const fl = store.portal[target + 'File'];
+  if (fl && fl.path) { try { if (fs.existsSync(fl.path)) return '/portal/dl/' + target; } catch {} }
+  return target === 'pc' ? store.portal.pcUrl : store.portal.androidUrl;
+}
 let dirty = false;
 function markUser(id) { if (!store.users[id]) dirty = true; store.users[id] = Date.now(); }
 setInterval(() => { if (!dirty) return; dirty = false; try { fs.writeFileSync(DATA_FILE + '.tmp', JSON.stringify(store)); fs.renameSync(DATA_FILE + '.tmp', DATA_FILE); } catch (e) { console.warn('save', e.message); } }, 10000);
@@ -97,10 +108,14 @@ const PORTAL_HTML = `<!doctype html>
  .brand b{font-size:1.5rem;letter-spacing:-.02em}
  .card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:26px}
  h1{font-size:1.25rem;margin:0 0 6px;text-wrap:balance}
+ h2.mini-h{font-size:1rem;margin:0 0 8px}
  p.sub{color:var(--muted);margin:0 0 18px;font-size:.95rem}
  label{display:block;font-size:.85rem;color:var(--muted);margin-bottom:6px}
  input{width:100%;padding:12px 14px;border-radius:11px;border:1px solid var(--line);background:#0e131c;color:var(--fg);font-size:1rem;font-family:inherit;letter-spacing:.04em}
  input:focus{outline:none;border-color:var(--accent)}
+ input[type=file]{padding:9px 0;font-size:.85rem;color:var(--muted);letter-spacing:0}
+ .chk{display:flex;align-items:center;gap:8px;margin-top:12px;font-size:.9rem;color:var(--muted);cursor:pointer}
+ .chk input{width:auto;padding:0}
  .btn{display:block;width:100%;margin-top:14px;padding:13px;border:none;border-radius:11px;font-size:1rem;font-weight:700;cursor:pointer;font-family:inherit;background:linear-gradient(140deg,var(--accent),#14b7d2);color:var(--accent-ink)}
  .btn.ghost{background:#0e131c;color:var(--fg);border:1px solid var(--line)}
  .btn.dl{text-decoration:none;text-align:center}
@@ -110,6 +125,13 @@ const PORTAL_HTML = `<!doctype html>
  .spin{width:34px;height:34px;border:3px solid var(--line);border-top-color:var(--accent);border-radius:50%;animation:spin 1s linear infinite;margin:10px auto}
  @keyframes spin{to{transform:rotate(360deg)}}
  .center{text-align:center}
+ .noapp{text-align:center;margin-top:16px}
+ .noapp a{color:var(--accent);text-decoration:none;font-size:.92rem;border-bottom:1px dashed var(--accent);cursor:pointer}
+ .dlbox{margin-top:6px}
+ .dlset{border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+ .cur{font-size:.82rem;color:var(--muted);margin-bottom:8px}
+ .cur span{color:var(--fg)}
+ .prog{font-size:.82rem;color:var(--accent);min-height:16px;margin-top:4px}
  .req{display:flex;align-items:center;gap:8px;padding:10px 12px;border:1px solid var(--line);border-radius:11px;margin-bottom:8px}
  .req b{font-family:monospace;letter-spacing:.06em;font-size:.95rem}
  .req .st{margin-left:auto;font-size:.78rem;color:var(--muted)}
@@ -126,11 +148,19 @@ const PORTAL_HTML = `<!doctype html>
  <div class="card">
   <div id="login">
    <h1>Вход по номеру аккаунта</h1>
-   <p class="sub">Введи свой ID из RedeemChat (вид XXXX-XXXX-XXXX). Заявка уйдёт администратору — дождись одобрения.</p>
+   <p class="sub">Введи свой ID из RedeemChat (вид XXXX-XXXX-XXXX). Заявка уйдёт администратору - дождись одобрения.</p>
    <label>Номер аккаунта</label>
    <input id="accId" maxlength="14" placeholder="XXXX-XXXX-XXXX" autocomplete="off" spellcheck="false">
+   <label class="chk"><input type="checkbox" id="rememberChk"> Сохранить выбор профиля</label>
    <button class="btn" id="loginBtn">Отправить заявку на вход</button>
    <div class="msg" id="loginMsg"></div>
+   <div class="noapp"><a id="noAppLink">Нету приложения?</a></div>
+   <div id="publicDl" class="hidden dlbox">
+    <p class="sub" style="margin:14px 0 10px">Свежие версии RedeemChat:</p>
+    <a class="btn dl" id="dlPcPub" href="#" download>Скачать на ПК</a>
+    <a class="btn dl" id="dlAndroidPub" href="#" download style="margin-top:10px">Скачать на Android</a>
+    <div class="hint" id="pubNote"></div>
+   </div>
   </div>
   <div id="pending" class="hidden center">
    <div class="spin"></div>
@@ -141,8 +171,8 @@ const PORTAL_HTML = `<!doctype html>
   <div id="approved" class="hidden center">
    <h1>Добро пожаловать!</h1>
    <p class="sub">Твой вход одобрен. Скачай RedeemChat:</p>
-   <a class="btn dl" id="dlPc" href="#" target="_blank" rel="noopener">Скачать для ПК</a>
-   <a class="btn dl" id="dlAndroid" href="#" target="_blank" rel="noopener" style="margin-top:10px">Скачать для Android</a>
+   <a class="btn dl" id="dlPc" href="#" download>Скачать на ПК</a>
+   <a class="btn dl" id="dlAndroid" href="#" download style="margin-top:10px">Скачать на Android</a>
    <div class="hint" id="dlNote"></div>
   </div>
   <div id="adminPin" class="hidden">
@@ -156,16 +186,30 @@ const PORTAL_HTML = `<!doctype html>
   </div>
   <div id="admin" class="hidden">
    <h1>Панель администратора</h1>
-   <p class="sub">Ссылки на кнопки скачивания и заявки на вход.</p>
-   <label>Ссылка «Скачать для ПК»</label>
-   <input id="pcUrl" placeholder="https://..." autocomplete="off" spellcheck="false">
-   <label style="margin-top:10px">Ссылка «Скачать для Android»</label>
-   <input id="androidUrl" placeholder="https://..." autocomplete="off" spellcheck="false">
+   <p class="sub">Загрузи файлы (тогда кнопки будут их скачивать) или вставь ссылки.</p>
+   <div class="dlset">
+    <h2 class="mini-h">Кнопка «Скачать на ПК»</h2>
+    <div class="cur">Сейчас: <span id="pcCur">не задано</span></div>
+    <input type="file" id="pcFileInput">
+    <button class="btn" id="pcUploadBtn">Загрузить файл для ПК</button>
+    <div class="prog" id="pcProg"></div>
+    <label style="margin-top:10px">или ссылка</label>
+    <input id="pcUrl" placeholder="https://..." autocomplete="off" spellcheck="false">
+   </div>
+   <div class="dlset">
+    <h2 class="mini-h">Кнопка «Скачать на Android»</h2>
+    <div class="cur">Сейчас: <span id="androidCur">не задано</span></div>
+    <input type="file" id="androidFileInput">
+    <button class="btn" id="androidUploadBtn">Загрузить файл для Android</button>
+    <div class="prog" id="androidProg"></div>
+    <label style="margin-top:10px">или ссылка</label>
+    <input id="androidUrl" placeholder="https://..." autocomplete="off" spellcheck="false">
+   </div>
    <button class="btn" id="saveLinks">Сохранить ссылки</button>
    <div class="msg" id="adminMsg"></div>
-   <h1 style="font-size:1rem;margin:20px 0 8px">Заявки на вход</h1>
+   <h2 class="mini-h" style="margin-top:20px">Заявки на вход</h2>
    <div id="reqList"></div>
-   <button class="btn ghost" id="adminRefresh" style="margin-top:4px">Обновить список</button>
+   <button class="btn ghost" id="adminRefresh">Обновить список</button>
   </div>
  </div>
  <div class="foot">RedeemChat - P2P-мессенджер</div>
@@ -179,28 +223,30 @@ const PORTAL_HTML = `<!doctype html>
  function api(path, body){
   return fetch(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})}).then(function(r){return r.json().then(function(j){return {code:r.status,j:j}})}).catch(function(){return {code:0,j:{}}})
  }
- function norm(v){
-  var c=(v||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12);
-  var out=c.slice(0,4); if(c.length>4)out+='-'+c.slice(4,8); if(c.length>8)out+='-'+c.slice(8,12); return out;
- }
+ function norm(v){ var c=(v||'').toUpperCase().replace(/[^A-Z0-9]/g,'').slice(0,12); var out=c.slice(0,4); if(c.length>4)out+='-'+c.slice(4,8); if(c.length>8)out+='-'+c.slice(8,12); return out; }
  $('accId').addEventListener('input',function(){this.value=norm(this.value)});
- var pollTimer=null;
- function startPoll(id){ stopPoll(); pollTimer=setInterval(function(){ api('/portal/status',{id:id}).then(function(r){ if(r.j.status==='approved'){ stopPoll(); showApproved(r.j) } }) },4000) }
- function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null} }
- function showApproved(j){
-   var pc=$('dlPc'),an=$('dlAndroid');
-   if(j.pc){pc.href=j.pc;pc.classList.remove('dis')}else{pc.href='#';pc.classList.add('dis')}
-   if(j.android){an.href=j.android;an.classList.remove('dis')}else{an.href='#';an.classList.add('dis')}
-   $('dlNote').textContent=(!j.pc&&!j.android)?'Ссылки на файлы ещё не заданы администратором.':'';
-   show('approved')
+ try{ var sv=localStorage.getItem('rc_portal_acc'); if(sv){ $('accId').value=sv; $('rememberChk').checked=true; } }catch(e){}
+ function saveRemember(){ try{ if($('rememberChk').checked) localStorage.setItem('rc_portal_acc',$('accId').value); else localStorage.removeItem('rc_portal_acc'); }catch(e){} }
+ $('rememberChk').addEventListener('change', saveRemember);
+ function getDownloads(cb){ fetch('/portal/downloads').then(function(r){return r.json()}).then(cb).catch(function(){cb({})}) }
+ function setDl(pcBtn, anBtn, note, d){
+  if(d.pc){pcBtn.href=d.pc;pcBtn.classList.remove('dis')}else{pcBtn.href='#';pcBtn.classList.add('dis')}
+  if(d.android){anBtn.href=d.android;anBtn.classList.remove('dis')}else{anBtn.href='#';anBtn.classList.add('dis')}
+  if(note) note.textContent=(!d.pc&&!d.android)?'Файлы ещё не добавлены администратором.':'';
  }
+ $('noAppLink').addEventListener('click',function(e){ e.preventDefault(); var box=$('publicDl'); if(box.classList.contains('hidden')){ getDownloads(function(d){ setDl($('dlPcPub'),$('dlAndroidPub'),$('pubNote'),d) }); box.classList.remove('hidden'); } else box.classList.add('hidden'); });
+ var pollTimer=null;
+ function startPoll(id){ stopPoll(); pollTimer=setInterval(function(){ api('/portal/status',{id:id}).then(function(r){ if(r.j.status==='approved'){ stopPoll(); showApproved() } }) },4000) }
+ function stopPoll(){ if(pollTimer){clearInterval(pollTimer);pollTimer=null} }
+ function showApproved(){ getDownloads(function(d){ setDl($('dlPc'),$('dlAndroid'),$('dlNote'),d) }); show('approved') }
  $('loginBtn').onclick=function(){
   var id=norm($('accId').value); var m=$('loginMsg'); m.className='msg';
   if(!/^[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$/.test(id)){m.className='msg bad';m.textContent='Введи номер вида XXXX-XXXX-XXXX';return}
+  saveRemember();
   m.textContent='Отправляем...';
   api('/portal/login',{id:id}).then(function(r){
    if(r.j.admin){ $('pinTitle').textContent=r.j.pinSet?'Вход администратора':'Создать PIN администратора'; $('pinSub').textContent=r.j.pinSet?'Введи PIN-код администратора.':'Задай PIN-код (минимум 4 символа). Запомни его - он защищает панель.'; $('pinBtn').textContent=r.j.pinSet?'Войти':'Создать PIN'; window._pinSet=r.j.pinSet; m.textContent=''; $('pinInput').value=''; show('adminPin'); return }
-   if(r.j.status==='approved'){ m.textContent=''; showApproved(r.j); return }
+   if(r.j.status==='approved'){ m.textContent=''; showApproved(); return }
    if(r.j.status==='pending'){ m.textContent=''; show('pending'); startPoll(id); return }
    m.className='msg bad'; m.textContent='Не получилось. Попробуй ещё раз.';
   })
@@ -213,10 +259,12 @@ const PORTAL_HTML = `<!doctype html>
   if(!window._pinSet){ api('/portal/admin/setpin',{id:ADMIN,pin:p}).then(function(r){ if(r.j.ok){pin=p;loadAdmin(m)}else{m.className='msg bad';m.textContent='Не удалось задать PIN (возможно, уже задан).'} }) }
   else { pin=p; loadAdmin(m) }
  };
+ function curText(name,url){ if(name) return 'файл: '+name; if(url) return 'ссылка'; return 'не задано'; }
  function loadAdmin(m){
   api('/portal/admin/data',{id:ADMIN,pin:pin}).then(function(r){
    if(!r.j.ok){ if(m){m.className='msg bad';m.textContent='Неверный PIN'} return }
    $('pcUrl').value=r.j.pcUrl||''; $('androidUrl').value=r.j.androidUrl||'';
+   $('pcCur').textContent=curText(r.j.pcFile,r.j.pcUrl); $('androidCur').textContent=curText(r.j.androidFile,r.j.androidUrl);
    renderReqs(r.j.requests||[]); show('admin')
   })
  }
@@ -240,9 +288,24 @@ const PORTAL_HTML = `<!doctype html>
  $('saveLinks').onclick=function(){
   var m=$('adminMsg'); m.className='msg'; m.textContent='Сохраняем...';
   api('/portal/admin/links',{id:ADMIN,pin:pin,pcUrl:$('pcUrl').value.trim(),androidUrl:$('androidUrl').value.trim()}).then(function(r){
-   if(r.j.ok){m.className='msg ok';m.textContent='Сохранено';$('pcUrl').value=r.j.pcUrl||'';$('androidUrl').value=r.j.androidUrl||''}else{m.className='msg bad';m.textContent='Ошибка (проверь PIN)'}
+   if(r.j.ok){m.className='msg ok';m.textContent='Сохранено';loadAdmin()}else{m.className='msg bad';m.textContent='Ошибка (проверь PIN)'}
   })
  };
+ function doUpload(target, fileInputId, progId){
+  var inp=$(fileInputId); var fl=inp.files&&inp.files[0]; if(!fl){var pr0=$(progId);pr0.textContent='Сначала выбери файл';return}
+  var pr=$(progId); pr.textContent='Загрузка 0%';
+  var xhr=new XMLHttpRequest();
+  xhr.open('POST','/portal/admin/upload?target='+target);
+  xhr.setRequestHeader('x-admin-id',ADMIN);
+  xhr.setRequestHeader('x-admin-pin',pin);
+  xhr.setRequestHeader('x-filename',encodeURIComponent(fl.name));
+  xhr.upload.onprogress=function(e){ if(e.lengthComputable){ pr.textContent='Загрузка '+Math.round(e.loaded/e.total*100)+'%'; } };
+  xhr.onload=function(){ if(xhr.status===200){ pr.textContent='Файл загружен ✓'; inp.value=''; loadAdmin(); } else { pr.textContent='Ошибка загрузки ('+xhr.status+')'; } };
+  xhr.onerror=function(){ pr.textContent='Ошибка сети при загрузке'; };
+  xhr.send(fl);
+ }
+ $('pcUploadBtn').onclick=function(){ doUpload('pc','pcFileInput','pcProg') };
+ $('androidUploadBtn').onclick=function(){ doUpload('android','androidFileInput','androidProg') };
 })();
 </script>
 </body>
@@ -474,7 +537,7 @@ const server = http.createServer(async (req, res) => {
     const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
     if (!portalAdmin(body)) return send(res, 403, { error: 'auth' });
     const requests = Object.values(store.portal.requests).sort((a, b) => b.ts - a.ts);
-    return send(res, 200, { ok: true, requests, pcUrl: store.portal.pcUrl, androidUrl: store.portal.androidUrl });
+    return send(res, 200, { ok: true, requests, pcUrl: store.portal.pcUrl, androidUrl: store.portal.androidUrl, pcFile: (store.portal.pcFile || {}).name || '', androidFile: (store.portal.androidFile || {}).name || '' });
   }
   if (p === '/portal/admin/approve' && req.method === 'POST') {
     const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
@@ -491,6 +554,54 @@ const server = http.createServer(async (req, res) => {
     dirty = true;
     return send(res, 200, { ok: true, pcUrl: store.portal.pcUrl, androidUrl: store.portal.androidUrl });
   }
+  // актуальные ссылки/файлы для кнопок (публично)
+  if (p === '/portal/downloads' && req.method === 'GET') return send(res, 200, { pc: effDl('pc'), android: effDl('android'), pcName: (store.portal.pcFile || {}).name || '', androidName: (store.portal.androidFile || {}).name || '' });
+  // загрузка файла админом (потоком на диск; авторизация в заголовках)
+  if (p === '/portal/admin/upload' && req.method === 'POST') {
+    if (!portalAdminHdr(req)) { res.writeHead(403, { 'Content-Type': 'application/json' }); return res.end('{"error":"auth"}'); }
+    const target = u.searchParams.get('target') === 'android' ? 'android' : 'pc';
+    let fname = 'file.bin';
+    try { fname = decodeURIComponent(str(req.headers['x-filename'], 400)); } catch { fname = str(req.headers['x-filename'], 120); }
+    fname = (fname || 'file.bin').replace(/[^\w.\- ]+/g, '_').slice(0, 120);
+    const dest = path.join(PORTAL_DIR, target + '__' + Date.now() + '__' + fname);
+    const ws = fs.createWriteStream(dest);
+    let size = 0, aborted = false;
+    req.on('data', c => { size += c.length; if (size > MAX_UPLOAD && !aborted) { aborted = true; try { ws.destroy(); } catch {} try { req.destroy(); } catch {} try { fs.unlinkSync(dest); } catch {} if (!res.headersSent) send(res, 413, { error: 'too big' }); } });
+    req.pipe(ws);
+    ws.on('finish', () => {
+      if (aborted) return;
+      const old = store.portal[target + 'File'];
+      if (old && old.path && old.path !== dest) { try { fs.unlinkSync(old.path); } catch {} }
+      store.portal[target + 'File'] = { name: fname, path: dest, size };
+      store.portal[target === 'pc' ? 'pcUrl' : 'androidUrl'] = '';
+      dirty = true;
+      send(res, 200, { ok: true, name: fname, size });
+    });
+    ws.on('error', () => { if (!aborted && !res.headersSent) send(res, 500, { error: 'write' }); });
+    req.on('error', () => { try { ws.destroy(); } catch {} });
+    return;
+  }
+  // удалить загруженный файл
+  if (p === '/portal/admin/delfile' && req.method === 'POST') {
+    const body = await readBody(req); if (!body) return send(res, 400, { error: 'bad' });
+    if (!portalAdmin(body)) return send(res, 403, { error: 'auth' });
+    const target = body.target === 'android' ? 'android' : 'pc';
+    const fl = store.portal[target + 'File'];
+    if (fl && fl.path) { try { fs.unlinkSync(fl.path); } catch {} }
+    store.portal[target + 'File'] = null; dirty = true;
+    return send(res, 200, { ok: true });
+  }
+  // отдача файла (скачивание)
+  if ((p === '/portal/dl/pc' || p === '/portal/dl/android') && req.method === 'GET') {
+    const target = p === '/portal/dl/android' ? 'android' : 'pc';
+    const fl = store.portal[target + 'File'];
+    if (!fl || !fl.path) return send(res, 404, { error: 'no file' });
+    let st; try { st = fs.statSync(fl.path); } catch { return send(res, 404, { error: 'gone' }); }
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': st.size, 'Content-Disposition': 'attachment; filename="' + fl.name.replace(/["\r\n]/g, '') + '"', 'Access-Control-Allow-Origin': '*', 'Cache-Control': 'no-store' });
+    const rs = fs.createReadStream(fl.path); rs.on('error', () => { try { res.destroy(); } catch {} }); rs.pipe(res);
+    return;
+  }
+
   if (p === '/' && req.method === 'GET') return sendHtml(res, PORTAL_HTML);
 
   if (p === '/health') return send(res, 200, { ok: true, service: 'redeemchat-api' });
