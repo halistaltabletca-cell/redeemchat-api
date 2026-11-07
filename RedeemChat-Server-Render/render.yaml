@@ -1,0 +1,7 @@
+services:
+  - type: web
+    name: redeemchat-api
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node api.js

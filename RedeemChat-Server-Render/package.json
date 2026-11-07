@@ -1,0 +1,9 @@
+{
+  "name": "redeemchat-api",
+  "version": "1.0.0",
+  "private": true,
+  "description": "RedeemChat catalog/API server",
+  "main": "api.js",
+  "scripts": { "start": "node api.js" },
+  "engines": { "node": ">=18" }
+}
